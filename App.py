@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Ultra-Optimized Motion Detection Script for Extremely Low-Powered Systems
-Designed for systems with <256MB RAM and limited processing power
-Modified to capture photos when motion is detected
+Low Power Motion Detection Photo Capture Script for Raspberry Pi
+Optimized for minimal resource consumption with USB camera support
+Takes photos only when motion is detected, saves to script directory
 """
 
 import cv2
@@ -13,286 +13,146 @@ import threading
 from datetime import datetime
 import argparse
 import sys
-import gc
-from collections import deque
+import signal
 
-def get_photo_directory():
-    """Ask user for photo save directory"""
-    while True:
-        photo_dir = input("Enter the directory path to save motion photos (or press Enter for default 'photos'): ").strip()
-        
-        if not photo_dir:
-            photo_dir = "photos"
-        
-        # Expand user path (~) if present
-        photo_dir = os.path.expanduser(photo_dir)
-        
-        try:
-            # Try to create directory if it doesn't exist
-            os.makedirs(photo_dir, exist_ok=True)
-            print(f"Photos will be saved to: {os.path.abspath(photo_dir)}")
-            return photo_dir
-        except Exception as e:
-            print(f"Error creating directory '{photo_dir}': {e}")
-            print("Please try a different path.")
-
-class UltraLowPowerMotionDetector:
-    def __init__(self, camera_id=0, sensitivity=2000, min_record_time=3, 
-                 max_record_time=30, output_dir="recordings", photo_dir=None):
+class LowPowerMotionDetector:
+    def __init__(self, camera_id=0, sensitivity=1000, photo_interval=2.0, 
+                 motion_timeout=5.0, resolution=(320, 240), fps=5):
         """
-        Ultra-optimized motion detector for very low-powered systems
+        Initialize low-power motion detector
         
         Args:
-            camera_id: USB camera device ID
-            sensitivity: Motion detection sensitivity (higher = less sensitive)
-            min_record_time: Minimum recording time in seconds
-            max_record_time: Maximum recording time in seconds
-            output_dir: Directory to save video recordings
-            photo_dir: Directory to save motion photos
+            camera_id: USB camera device ID (usually 0 for first USB camera)
+            sensitivity: Motion detection sensitivity (lower = more sensitive)
+            photo_interval: Minimum seconds between photos
+            motion_timeout: Seconds to wait after last motion before stopping
+            resolution: Camera resolution tuple (width, height) - lower = less resources
+            fps: Camera FPS - lower = less CPU usage
         """
         self.camera_id = camera_id
         self.sensitivity = sensitivity
-        self.min_record_time = min_record_time
-        self.max_record_time = max_record_time
-        self.output_dir = output_dir
+        self.photo_interval = photo_interval
+        self.motion_timeout = motion_timeout
+        self.frame_width, self.frame_height = resolution
+        self.fps = fps
         
-        # Ask for photo directory if not provided
-        if photo_dir is None:
-            self.photo_dir = get_photo_directory()
-        else:
-            self.photo_dir = photo_dir
-            os.makedirs(photo_dir, exist_ok=True)
+        # Use script directory for photos
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.photo_dir = os.path.join(self.script_dir, "motion_photos")
+        os.makedirs(self.photo_dir, exist_ok=True)
         
-        # Create output directories
-        os.makedirs(output_dir, exist_ok=True)
+        # Motion detection - simplified for low resource usage
+        self.background_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=100,  # Reduced history for less memory
+            varThreshold=30,  # Lower threshold for better detection
+            detectShadows=False  # Disable shadow detection to save CPU
+        )
         
-        # Ultra-low memory settings
-        self.frame_width = 320   # Very small resolution
-        self.frame_height = 240
-        self.fps = 10            # Lower FPS
-        self.process_every_n_frames = 2  # Skip frames for processing
-        
-        # Lightweight motion detection
-        self.background_frame = None
-        self.frame_count = 0
-        self.background_update_rate = 0.01  # Very slow background update
-        
-        # Recording variables
-        self.is_recording = False
-        self.video_writer = None
-        self.recording_start_time = None
-        self.last_motion_time = None
-        
-        # Photo capture variables
-        self.last_photo_time = 0
-        self.photo_cooldown = 2.0  # Minimum seconds between photos
-        self.photos_taken = 0
-        
-        # Camera setup
+        # State variables
         self.cap = None
-        
-        # Control variables
         self.running = False
-        self.paused = False
+        self.last_motion_time = 0
+        self.last_photo_time = 0
+        self.motion_detected = False
+        self.photo_count = 0
+        self.motion_sequence = 0
         
-        # Statistics
-        self.motion_count = 0
-        self.total_recordings = 0
+        # Performance counters
+        self.frame_count = 0
+        self.start_time = time.time()
         
-        # Memory-efficient motion tracking
-        self.motion_history = deque(maxlen=5)  # Only keep last 5 motion events
-        
-        # Frame buffers (pre-allocate to avoid repeated allocation)
-        self.gray_frame = np.zeros((self.frame_height, self.frame_width), dtype=np.uint8)
-        self.diff_frame = np.zeros((self.frame_height, self.frame_width), dtype=np.uint8)
-        self.thresh_frame = np.zeros((self.frame_height, self.frame_width), dtype=np.uint8)
-        
-        print(f"Ultra-low power motion detector initialized")
-        print(f"Resolution: {self.frame_width}x{self.frame_height} @ {self.fps}fps")
-        print(f"Memory usage optimized for systems with <256MB RAM")
-        print(f"Photos will be saved to: {os.path.abspath(self.photo_dir)}")
+        print(f"Low Power Motion Detector initialized")
+        print(f"Camera ID: {camera_id}")
+        print(f"Resolution: {self.frame_width}x{self.frame_height}")
+        print(f"FPS: {fps}")
+        print(f"Sensitivity: {sensitivity}")
+        print(f"Photo directory: {self.photo_dir}")
+    
+    def find_usb_camera(self):
+        """Find available USB camera - simplified"""
+        for camera_id in range(5):  # Check first 5 camera indices
+            cap = cv2.VideoCapture(camera_id)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                cap.release()
+                if ret:
+                    print(f"Found USB camera at index {camera_id}")
+                    return camera_id
+        return self.camera_id
     
     def initialize_camera(self):
-        """Initialize camera with ultra-low memory settings"""
+        """Initialize USB camera with minimal resource settings"""
+        # Find camera if needed
+        if self.camera_id == 0:
+            self.camera_id = self.find_usb_camera()
+        
         self.cap = cv2.VideoCapture(self.camera_id)
         
         if not self.cap.isOpened():
-            print(f"Error: Could not open camera {self.camera_id}")
+            print(f"Error: Could not open USB camera at index {self.camera_id}")
             return False
         
-        # Set ultra-low memory properties
+        # Set minimal resource properties
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer
         
-        # Try to use most efficient codec
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('Y', 'U', 'Y', 'V'))
+        # Use MJPEG for USB cameras (more efficient)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         
-        # Disable auto-exposure and gain for consistent performance
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        self.cap.set(cv2.CAP_PROP_GAIN, 0)
+        # Verify settings
+        actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
         
-        print(f"Camera initialized at {self.frame_width}x{self.frame_height}")
+        print(f"Camera initialized: {actual_width}x{actual_height} @ {actual_fps:.1f}fps")
         return True
     
-    def detect_motion_lightweight(self, frame):
-        """Ultra-lightweight motion detection using frame differencing"""
-        # Convert to grayscale in-place
-        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY, dst=self.gray_frame)
+    def detect_motion(self, frame):
+        """Lightweight motion detection"""
+        # Apply background subtraction
+        fg_mask = self.background_subtractor.apply(frame)
         
-        # Blur to reduce noise (small kernel for speed)
-        cv2.GaussianBlur(self.gray_frame, (5, 5), 0, dst=self.gray_frame)
+        # Simple noise reduction - minimal processing
+        kernel = np.ones((3, 3), np.uint8)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
         
-        # Initialize background if needed
-        if self.background_frame is None:
-            self.background_frame = self.gray_frame.copy()
-            return False, 0
+        # Count white pixels (motion pixels)
+        motion_pixels = cv2.countNonZero(fg_mask)
         
-        # Frame differencing
-        cv2.absdiff(self.background_frame, self.gray_frame, dst=self.diff_frame)
-        
-        # Threshold
-        cv2.threshold(self.diff_frame, 25, 255, cv2.THRESH_BINARY, dst=self.thresh_frame)
-        
-        # Count non-zero pixels (motion area)
-        motion_pixels = cv2.countNonZero(self.thresh_frame)
-        
-        # Update background very slowly
-        cv2.addWeighted(self.background_frame, 1 - self.background_update_rate, 
-                       self.gray_frame, self.background_update_rate, 0, 
-                       dst=self.background_frame)
-        
-        return motion_pixels > self.sensitivity, motion_pixels
+        return motion_pixels > self.sensitivity
     
-    def capture_photo(self, frame):
-        """Capture and save a photo when motion is detected"""
+    def save_photo(self, frame):
+        """Save photo with timestamp"""
         current_time = time.time()
         
-        # Check cooldown period to avoid too many photos
-        if current_time - self.last_photo_time < self.photo_cooldown:
-            return None
-        
-        # Generate filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"motion_{timestamp}.jpg"
-        filepath = os.path.join(self.photo_dir, filename)
-        
-        # Save the photo
-        success = cv2.imwrite(filepath, frame)
-        
-        if success:
-            self.last_photo_time = current_time
-            self.photos_taken += 1
-            print(f"Photo captured: {filename}")
-            return filename
-        else:
-            print(f"Error saving photo: {filename}")
-            return None
-    
-    def start_recording(self):
-        """Start ultra-lightweight video recording"""
-        if self.is_recording:
-            return
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"motion_{timestamp}.mp4"
-        filepath = os.path.join(self.output_dir, filename)
-        
-        # Use most efficient codec
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        self.video_writer = cv2.VideoWriter(
-            filepath, fourcc, self.fps, (self.frame_width, self.frame_height)
-        )
-        
-        self.is_recording = True
-        self.recording_start_time = time.time()
-        self.total_recordings += 1
-        print(f"Recording: {filename}")
-        return filename
-    
-    def stop_recording(self):
-        """Stop video recording"""
-        if not self.is_recording:
-            return
-        
-        self.is_recording = False
-        if self.video_writer:
-            self.video_writer.release()
-            self.video_writer = None
-        
-        duration = time.time() - self.recording_start_time
-        print(f"Recording stopped: {duration:.1f}s")
-        
-        # Force garbage collection after recording
-        gc.collect()
-        return duration
-    
-    def should_stop_recording(self):
-        """Check if recording should stop"""
-        if not self.is_recording:
+        # Check if enough time has passed since last photo
+        if current_time - self.last_photo_time < self.photo_interval:
             return False
         
-        current_time = time.time()
-        recording_duration = current_time - self.recording_start_time
-        time_since_motion = current_time - self.last_motion_time if self.last_motion_time else 0
+        # Generate filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"motion_{self.motion_sequence:03d}_{timestamp}_{self.photo_count:03d}.jpg"
+        filepath = os.path.join(self.photo_dir, filename)
         
-        # Stop conditions
-        if recording_duration >= self.max_record_time:
-            return True
+        # Save photo with high compression to save space
+        cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         
-        if (recording_duration >= self.min_record_time and 
-            time_since_motion > 2):  # 2 seconds after last motion
-            return True
+        self.last_photo_time = current_time
+        self.photo_count += 1
         
-        return False
+        print(f"Photo saved: {filename}")
+        return True
     
-    def process_frame(self, frame):
-        """Process frame with minimal overhead"""
-        self.frame_count += 1
-        
-        # Skip frames to reduce processing load
-        if self.frame_count % self.process_every_n_frames != 0:
-            if self.is_recording and self.video_writer:
-                self.video_writer.write(frame)
-            return False, 0
-        
-        if self.paused:
-            return False, 0
-        
-        motion_detected, motion_area = self.detect_motion_lightweight(frame)
-        
-        if motion_detected:
-            self.last_motion_time = time.time()
-            self.motion_count += 1
-            self.motion_history.append(time.time())
-            
-            # Capture photo when motion is detected
-            self.capture_photo(frame)
-            
-            if not self.is_recording:
-                self.start_recording()
-        
-        # Record frame
-        if self.is_recording and self.video_writer:
-            self.video_writer.write(frame)
-        
-        # Check if should stop recording
-        if self.should_stop_recording():
-            self.stop_recording()
-        
-        return motion_detected, motion_area
-    
-    def run_detection(self):
-        """Main detection loop optimized for low-powered systems"""
-        print("Starting ultra-low power motion detection...")
-        print("Press Ctrl+C to stop")
-        
+    def run(self):
+        """Main detection loop"""
         if not self.initialize_camera():
-            return
+            return False
         
         self.running = True
-        last_status_time = time.time()
+        print("Starting motion detection...")
+        print("Press Ctrl+C to stop")
         
         try:
             while self.running:
@@ -301,213 +161,122 @@ class UltraLowPowerMotionDetector:
                     print("Failed to read frame")
                     break
                 
-                motion_detected, motion_area = self.process_frame(frame)
-                
-                # Status update every 10 seconds
                 current_time = time.time()
-                if current_time - last_status_time > 10:
-                    status = "REC" if self.is_recording else "MON"
-                    motion_rate = len(self.motion_history) / 5.0  # motions per second over last 5 events
-                    print(f"[{status}] Motion: {motion_detected} | Rate: {motion_rate:.1f}/s | Total: {self.motion_count} | Photos: {self.photos_taken}")
-                    last_status_time = current_time
-                    
-                    # Force garbage collection periodically
-                    if self.frame_count % 300 == 0:  # Every 30 seconds at 10fps
-                        gc.collect()
+                self.frame_count += 1
                 
-                # Small delay to prevent overwhelming the system
-                time.sleep(0.01)
+                # Detect motion
+                motion_detected = self.detect_motion(frame)
+                
+                if motion_detected:
+                    if not self.motion_detected:
+                        # New motion sequence started
+                        self.motion_sequence += 1
+                        self.photo_count = 0
+                        print(f"Motion detected! Starting sequence {self.motion_sequence}")
+                    
+                    self.motion_detected = True
+                    self.last_motion_time = current_time
+                    
+                    # Save photo
+                    self.save_photo(frame)
+                    
+                else:
+                    # Check if motion has stopped
+                    if (self.motion_detected and 
+                        current_time - self.last_motion_time > self.motion_timeout):
+                        print(f"Motion stopped. Sequence {self.motion_sequence} complete ({self.photo_count} photos)")
+                        self.motion_detected = False
+                
+                # Print status periodically
+                if self.frame_count % (self.fps * 10) == 0:  # Every 10 seconds
+                    elapsed = current_time - self.start_time
+                    fps_actual = self.frame_count / elapsed
+                    status = "MOTION" if self.motion_detected else "MONITORING"
+                    print(f"Status: {status} | FPS: {fps_actual:.1f} | Photos: {self.photo_count}")
+                
+                # Small delay to prevent excessive CPU usage
+                time.sleep(0.1)
                 
         except KeyboardInterrupt:
-            print("\nStopping detection...")
+            print("\nStopping motion detection...")
         finally:
             self.cleanup()
+        
+        return True
     
     def cleanup(self):
         """Clean up resources"""
         self.running = False
-        if self.is_recording:
-            self.stop_recording()
-        
         if self.cap:
             self.cap.release()
         
-        cv2.destroyAllWindows()
-        gc.collect()
-        print(f"Detection stopped. Total photos taken: {self.photos_taken}")
+        # Print summary
+        elapsed = time.time() - self.start_time
+        print(f"\nSummary:")
+        print(f"Total runtime: {elapsed:.1f} seconds")
+        print(f"Total frames processed: {self.frame_count}")
+        print(f"Motion sequences: {self.motion_sequence}")
+        print(f"Photos saved to: {self.photo_dir}")
         print("Cleanup complete")
 
-class MinimalGUI:
-    """Extremely minimal GUI for ultra-low power systems"""
-    def __init__(self):
-        try:
-            import tkinter as tk
-            from tkinter import ttk, filedialog, messagebox
-            self.tk = tk
-            self.ttk = ttk
-            self.filedialog = filedialog
-            self.messagebox = messagebox
-            self.gui_available = True
-        except ImportError:
-            self.gui_available = False
-            print("GUI not available - running in command line mode")
-            return
-        
-        self.root = tk.Tk()
-        self.root.title("Ultra-Low Power Motion Detector")
-        self.root.geometry("450x350")
-        
-        self.detector = None
-        self.detection_thread = None
-        self.photo_dir = None
-        
-        # Simple variables
-        self.status_var = tk.StringVar(value="Ready")
-        self.motion_count_var = tk.IntVar(value=0)
-        self.recording_var = tk.StringVar(value="No")
-        self.photos_taken_var = tk.IntVar(value=0)
-        self.photo_dir_var = tk.StringVar(value="No directory selected")
-        
-        self.setup_minimal_gui()
-    
-    def setup_minimal_gui(self):
-        """Setup minimal GUI"""
-        if not self.gui_available:
-            return
-        
-        # Main frame
-        main_frame = self.ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill='both', expand=True)
-        
-        # Photo directory selection
-        dir_frame = self.ttk.Frame(main_frame)
-        dir_frame.pack(fill='x', pady=5)
-        
-        self.ttk.Label(dir_frame, text="Photo Directory:", font=('Arial', 12, 'bold')).pack(anchor='w')
-        self.ttk.Label(dir_frame, textvariable=self.photo_dir_var, font=('Arial', 9), wraplength=400).pack(anchor='w')
-        
-        self.ttk.Button(dir_frame, text="Select Directory", command=self.select_photo_directory).pack(anchor='w', pady=5)
-        
-        # Status display
-        self.ttk.Label(main_frame, text="Status:", font=('Arial', 12, 'bold')).pack(pady=5)
-        self.ttk.Label(main_frame, textvariable=self.status_var, font=('Arial', 10)).pack(pady=5)
-        
-        self.ttk.Label(main_frame, text="Motion Count:", font=('Arial', 12, 'bold')).pack(pady=5)
-        self.ttk.Label(main_frame, textvariable=self.motion_count_var, font=('Arial', 10)).pack(pady=5)
-        
-        self.ttk.Label(main_frame, text="Recording:", font=('Arial', 12, 'bold')).pack(pady=5)
-        self.ttk.Label(main_frame, textvariable=self.recording_var, font=('Arial', 10)).pack(pady=5)
-        
-        self.ttk.Label(main_frame, text="Photos Taken:", font=('Arial', 12, 'bold')).pack(pady=5)
-        self.ttk.Label(main_frame, textvariable=self.photos_taken_var, font=('Arial', 10)).pack(pady=5)
-        
-        # Control buttons
-        control_frame = self.ttk.Frame(main_frame)
-        control_frame.pack(pady=20)
-        
-        self.start_btn = self.ttk.Button(control_frame, text="Start", command=self.start_detection)
-        self.start_btn.pack(side='left', padx=5)
-        
-        self.stop_btn = self.ttk.Button(control_frame, text="Stop", command=self.stop_detection, state='disabled')
-        self.stop_btn.pack(side='left', padx=5)
-        
-        # Update status periodically
-        self.update_status()
-    
-    def select_photo_directory(self):
-        """Select directory for saving photos"""
-        directory = self.filedialog.askdirectory(title="Select directory to save motion photos")
-        if directory:
-            self.photo_dir = directory
-            self.photo_dir_var.set(directory)
-            print(f"Photo directory set to: {directory}")
-    
-    def start_detection(self):
-        """Start detection in thread"""
-        if not self.gui_available:
-            return
-        
-        if not self.photo_dir:
-            self.messagebox.showerror("Error", "Please select a directory to save photos first!")
-            return
-        
-        self.detector = UltraLowPowerMotionDetector(photo_dir=self.photo_dir)
-        
-        def detection_thread():
-            self.detector.run_detection()
-        
-        self.detection_thread = threading.Thread(target=detection_thread, daemon=True)
-        self.detection_thread.start()
-        
-        self.start_btn.config(state='disabled')
-        self.stop_btn.config(state='normal')
-        self.status_var.set("Running")
-    
-    def stop_detection(self):
-        """Stop detection"""
-        if self.detector:
-            self.detector.running = False
-            self.detector.cleanup()
-        
-        self.start_btn.config(state='normal')
-        self.stop_btn.config(state='disabled')
-        self.status_var.set("Stopped")
-    
-    def update_status(self):
-        """Update status display"""
-        if not self.gui_available:
-            return
-        
-        if self.detector:
-            self.motion_count_var.set(self.detector.motion_count)
-            self.recording_var.set("Yes" if self.detector.is_recording else "No")
-            self.photos_taken_var.set(self.detector.photos_taken)
-        
-        self.root.after(1000, self.update_status)  # Update every second
-    
-    def run(self):
-        """Run GUI"""
-        if not self.gui_available:
-            # Fallback to command line
-            detector = UltraLowPowerMotionDetector()
-            detector.run_detection()
-            return
-        
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.root.mainloop()
-    
-    def on_closing(self):
-        """Handle window closing"""
-        self.stop_detection()
-        self.root.destroy()
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\nReceived interrupt signal...")
+    sys.exit(0)
 
 def main():
-    parser = argparse.ArgumentParser(description="Ultra-Low Power Motion Detection with Photo Capture")
-    parser.add_argument("--nogui", action="store_true", help="Run without GUI")
-    parser.add_argument("--camera", type=int, default=0, help="Camera ID")
-    parser.add_argument("--sensitivity", type=int, default=2000, help="Motion sensitivity")
-    parser.add_argument("--min-time", type=int, default=3, help="Min recording time")
-    parser.add_argument("--max-time", type=int, default=30, help="Max recording time")
-    parser.add_argument("--output", type=str, default="recordings", help="Output directory for videos")
-    parser.add_argument("--photos", type=str, help="Photo directory (if not specified, will ask user)")
+    parser = argparse.ArgumentParser(description="Low Power Motion Detection Photo Capture")
+    parser.add_argument("--camera", type=int, default=0, help="USB Camera ID (default: 0)")
+    parser.add_argument("--sensitivity", type=int, default=1000, 
+                       help="Motion sensitivity - lower = more sensitive (default: 1000)")
+    parser.add_argument("--photo-interval", type=float, default=2.0, 
+                       help="Minimum seconds between photos (default: 2.0)")
+    parser.add_argument("--motion-timeout", type=float, default=5.0, 
+                       help="Seconds to wait after motion stops (default: 5.0)")
+    parser.add_argument("--resolution", type=str, default="320x240", 
+                       help="Camera resolution WxH (default: 320x240)")
+    parser.add_argument("--fps", type=int, default=5, 
+                       help="Camera FPS - lower = less CPU usage (default: 5)")
+    parser.add_argument("--test-camera", action="store_true", 
+                       help="Test camera and exit")
     
     args = parser.parse_args()
     
-    if args.nogui:
-        # Command line mode
-        detector = UltraLowPowerMotionDetector(
-            camera_id=args.camera,
-            sensitivity=args.sensitivity,
-            min_record_time=args.min_time,
-            max_record_time=args.max_time,
-            output_dir=args.output,
-            photo_dir=args.photos
-        )
-        detector.run_detection()
-    else:
-        # Try minimal GUI
-        gui = MinimalGUI()
-        gui.run()
+    # Parse resolution
+    try:
+        width, height = map(int, args.resolution.split('x'))
+        resolution = (width, height)
+    except ValueError:
+        print("Invalid resolution format. Use WxH (e.g., 320x240)")
+        return 1
+    
+    # Test camera mode
+    if args.test_camera:
+        print("Testing camera...")
+        detector = LowPowerMotionDetector(camera_id=args.camera, resolution=resolution)
+        if detector.initialize_camera():
+            print("Camera test successful!")
+            detector.cleanup()
+            return 0
+        else:
+            print("Camera test failed!")
+            return 1
+    
+    # Setup signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Create and run detector
+    detector = LowPowerMotionDetector(
+        camera_id=args.camera,
+        sensitivity=args.sensitivity,
+        photo_interval=args.photo_interval,
+        motion_timeout=args.motion_timeout,
+        resolution=resolution,
+        fps=args.fps
+    )
+    
+    success = detector.run()
+    return 0 if success else 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

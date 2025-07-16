@@ -56,6 +56,7 @@ class LowPowerMotionDetector:
         self.motion_detected = False
         self.photo_count = 0
         self.motion_sequence = 0
+        self.motion_boxes = []  # Store detected motion bounding boxes
         
         # Performance counters
         self.frame_count = 0
@@ -110,7 +111,7 @@ class LowPowerMotionDetector:
         return True
     
     def detect_motion(self, frame):
-        """Lightweight motion detection"""
+        """Lightweight motion detection with bounding box detection"""
         # Apply background subtraction
         fg_mask = self.background_subtractor.apply(frame)
         
@@ -118,18 +119,63 @@ class LowPowerMotionDetector:
         kernel = np.ones((3, 3), np.uint8)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
         
-        # Count white pixels (motion pixels)
-        motion_pixels = cv2.countNonZero(fg_mask)
+        # Find contours for bounding boxes
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        return motion_pixels > self.sensitivity
+        # Filter contours and get bounding boxes
+        motion_boxes = []
+        total_motion_area = 0
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 50:  # Filter small noise
+                x, y, w, h = cv2.boundingRect(contour)
+                # Filter tiny boxes
+                if w > 10 and h > 10:
+                    motion_boxes.append((x, y, w, h))
+                    total_motion_area += area
+        
+        # Store motion boxes for drawing
+        self.motion_boxes = motion_boxes
+        
+        return total_motion_area > self.sensitivity
     
     def save_photo(self, frame):
-        """Save photo with timestamp"""
+        """Save photo with timestamp and motion detection boxes"""
         current_time = time.time()
         
         # Check if enough time has passed since last photo
         if current_time - self.last_photo_time < self.photo_interval:
             return False
+        
+        # Create a copy of the frame to draw on
+        photo_frame = frame.copy()
+        
+        # Draw bounding boxes around detected motion
+        for i, (x, y, w, h) in enumerate(self.motion_boxes):
+            # Draw green rectangle around detected object
+            cv2.rectangle(photo_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            
+            # Add object number label
+            label = f"Object {i+1}"
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            
+            # Position label above the box
+            label_y = y - 10 if y - 10 > 10 else y + h + 20
+            cv2.rectangle(photo_frame, (x, label_y - label_size[1] - 5), 
+                         (x + label_size[0] + 5, label_y + 5), (0, 255, 0), -1)
+            cv2.putText(photo_frame, label, (x + 2, label_y - 2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        # Add timestamp and detection info
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        detection_info = f"Objects: {len(self.motion_boxes)} | {timestamp_str}"
+        
+        # Add text background
+        text_size = cv2.getTextSize(detection_info, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+        cv2.rectangle(photo_frame, (10, 10), (20 + text_size[0], 35), (0, 0, 0), -1)
+        cv2.putText(photo_frame, detection_info, (15, 28), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
         
         # Generate filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -137,12 +183,12 @@ class LowPowerMotionDetector:
         filepath = os.path.join(self.photo_dir, filename)
         
         # Save photo with high compression to save space
-        cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        cv2.imwrite(filepath, photo_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         
         self.last_photo_time = current_time
         self.photo_count += 1
         
-        print(f"Photo saved: {filename}")
+        print(f"Photo saved: {filename} ({len(self.motion_boxes)} objects detected)")
         return True
     
     def run(self):
@@ -192,7 +238,8 @@ class LowPowerMotionDetector:
                     elapsed = current_time - self.start_time
                     fps_actual = self.frame_count / elapsed
                     status = "MOTION" if self.motion_detected else "MONITORING"
-                    print(f"Status: {status} | FPS: {fps_actual:.1f} | Photos: {self.photo_count}")
+                    objects_str = f" ({len(self.motion_boxes)} objects)" if self.motion_detected else ""
+                    print(f"Status: {status}{objects_str} | FPS: {fps_actual:.1f} | Photos: {self.photo_count}")
                 
                 # Small delay to prevent excessive CPU usage
                 time.sleep(0.1)

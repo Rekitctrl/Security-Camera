@@ -3,6 +3,7 @@
 Self-Learning Motion Detection System for Raspberry Pi
 Learns from its environment and improves accuracy over time
 Saves learning progress and adapts to different conditions
+Now with date-based and time-based folder organization
 “””
 
 import cv2
@@ -37,10 +38,15 @@ self.fps = fps
 ```
     # Directory setup
     self.script_dir = os.path.dirname(os.path.abspath(__file__))
-    self.photo_dir = os.path.join(self.script_dir, "motion_photos")
+    self.base_photo_dir = os.path.join(self.script_dir, "motion_photos")
     self.learning_dir = os.path.join(self.script_dir, "learning_data")
-    os.makedirs(self.photo_dir, exist_ok=True)
+    os.makedirs(self.base_photo_dir, exist_ok=True)
     os.makedirs(self.learning_dir, exist_ok=True)
+
+    # Current date folder will be created dynamically
+    self.current_date = None
+    self.photo_dir = None
+    self.current_detection_dir = None
     
     # Learning system files
     self.learning_file = os.path.join(self.learning_dir, "learning_progress.json")
@@ -95,6 +101,52 @@ self.fps = fps
     print(f"📊 Learning sessions: {self.learning_data.get('sessions', 0)}")
     print(f"🎯 Detection accuracy: {self.learning_data.get('accuracy', 0):.1f}%")
     print(f"⚙️  Current sensitivity: {self.current_sensitivity}")
+
+def get_date_photo_dir(self):
+    """Get or create photo directory for current date"""
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    
+    if self.current_date != current_date:
+        self.current_date = current_date
+        self.photo_dir = os.path.join(self.base_photo_dir, current_date)
+        os.makedirs(self.photo_dir, exist_ok=True)
+        print(f"📁 Created/Using date folder: {self.photo_dir}")
+    
+    return self.photo_dir
+
+def get_detection_folder(self):
+    """Create a new folder for each detection sequence with timestamp"""
+    detection_time = datetime.now().strftime("%H%M%S")
+    date_dir = self.get_date_photo_dir()
+    detection_dir = os.path.join(date_dir, f"detection_{detection_time}")
+    os.makedirs(detection_dir, exist_ok=True)
+    return detection_dir
+
+def get_folder_stats(self):
+    """Get statistics about saved detection folders"""
+    if not os.path.exists(self.base_photo_dir):
+        return {}
+    
+    stats = {}
+    for date_folder in os.listdir(self.base_photo_dir):
+        date_path = os.path.join(self.base_photo_dir, date_folder)
+        if os.path.isdir(date_path):
+            detection_count = 0
+            photo_count = 0
+            
+            for detection_folder in os.listdir(date_path):
+                detection_path = os.path.join(date_path, detection_folder)
+                if os.path.isdir(detection_path) and detection_folder.startswith('detection_'):
+                    detection_count += 1
+                    photos = [f for f in os.listdir(detection_path) if f.endswith('.jpg')]
+                    photo_count += len(photos)
+            
+            stats[date_folder] = {
+                'detections': detection_count,
+                'photos': photo_count
+            }
+    
+    return stats
 
 def load_learning_data(self):
     """Load persistent learning data"""
@@ -450,10 +502,10 @@ def save_photo_with_learning(self, frame, confidence):
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         y_offset += 25
     
-    # Save photo
+    # Save photo to detection-specific folder
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"motion_{self.motion_sequence:03d}_{timestamp}_c{confidence:.2f}.jpg"
-    filepath = os.path.join(self.photo_dir, filename)
+    filepath = os.path.join(self.current_detection_dir, filename)
     
     cv2.imwrite(filepath, save_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
     
@@ -488,7 +540,10 @@ def run(self):
                 if not self.motion_detected:
                     self.motion_sequence += 1
                     self.photo_count = 0
+                    # Create new detection folder for this sequence
+                    self.current_detection_dir = self.get_detection_folder()
                     print(f"🚨 Motion detected! Seq {self.motion_sequence} | Conf: {confidence:.2f}")
+                    print(f"📁 Saving to: {self.current_detection_dir}")
                 
                 self.motion_detected = True
                 self.last_motion_time = current_time
@@ -536,6 +591,7 @@ def cleanup(self):
     self.motion_history.clear()
     self.lighting_conditions.clear()
     self.motion_confidence_history.clear()
+    self.current_detection_dir = None
     gc.collect()
     
     # Print final summary
@@ -549,6 +605,13 @@ def cleanup(self):
     print(f"   Final sensitivity: {self.current_sensitivity:.1f}")
     print(f"   Learning sessions: {self.learning_data['sessions']}")
     print(f"   Learning data saved to: {self.learning_dir}")
+    
+    # Print folder statistics
+    folder_stats = self.get_folder_stats()
+    if folder_stats:
+        print(f"\n📁 Folder Statistics:")
+        for date, stats in folder_stats.items():
+            print(f"   {date}: {stats['detections']} detections, {stats['photos']} photos")
 ```
 
 def signal_handler(sig, frame):
@@ -566,6 +629,7 @@ parser.add_argument(”–resolution”, type=str, default=“160x120”, help=�
 parser.add_argument(”–fps”, type=int, default=3, help=“FPS”)
 parser.add_argument(”–reset-learning”, action=“store_true”, help=“Reset learning data”)
 parser.add_argument(”–show-stats”, action=“store_true”, help=“Show learning stats”)
+parser.add_argument(”–show-folders”, action=“store_true”, help=“Show folder statistics”)
 parser.add_argument(”–test”, action=“store_true”, help=“Test camera”)
 
 ```
@@ -597,6 +661,23 @@ if args.show_stats:
     print(f"   Total detections: {detector.learning_data['total_detections']}")
     print(f"   Accuracy: {detector.learning_data['accuracy']:.1f}%")
     print(f"   Confirmed patterns: {len(detector.motion_patterns['confirmed_patterns'])}")
+    return 0
+
+# Show folder statistics
+if args.show_folders:
+    detector = LearningMotionDetector(resolution=resolution)
+    folder_stats = detector.get_folder_stats()
+    if folder_stats:
+        print(f"\n📁 Folder Statistics:")
+        total_detections = 0
+        total_photos = 0
+        for date, stats in sorted(folder_stats.items()):
+            print(f"   {date}: {stats['detections']} detections, {stats['photos']} photos")
+            total_detections += stats['detections']
+            total_photos += stats['photos']
+        print(f"\n   Total: {total_detections} detections, {total_photos} photos across {len(folder_stats)} days")
+    else:
+        print("📁 No detection folders found")
     return 0
 
 # Test camera

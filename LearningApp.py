@@ -55,7 +55,7 @@ class LearningMotionDetector:
         # Motion detection
         self.prev_frame = None
         self.motion_history = deque(maxlen=10)
-        self.motion_threshold = 0.3
+        self.motion_threshold = 0.2
         
         # Learning components
         self.learning_data = self.load_learning_data()
@@ -92,7 +92,7 @@ class LearningMotionDetector:
         
         # Learning parameters
         self.learning_rate = 0.1
-        self.confidence_threshold = 0.7
+        self.confidence_threshold = 0.4
         self.adaptation_interval = 300  # 5 minutes
         self.last_adaptation = time.time()
         

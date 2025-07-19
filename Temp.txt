@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-“””
-Low Power Motion Detection Photo Capture Script for Raspberry Pi
-Optimized for minimal resource consumption with USB camera support
-Takes photos only when motion is detected, saves to date-based folders
-“””
 
 import cv2
 import numpy as np
@@ -16,356 +11,290 @@ import sys
 import signal
 
 class LowPowerMotionDetector:
-def **init**(self, camera_id=0, sensitivity=1000, photo_interval=2.0,
-motion_timeout=5.0, resolution=(320, 240), fps=5):
-“””
-Initialize low-power motion detector
-
-```
-    Args:
-        camera_id: USB camera device ID (usually 0 for first USB camera)
-        sensitivity: Motion detection sensitivity (lower = more sensitive)
-        photo_interval: Minimum seconds between photos
-        motion_timeout: Seconds to wait after last motion before stopping
-        resolution: Camera resolution tuple (width, height) - lower = less resources
-        fps: Camera FPS - lower = less CPU usage
-    """
-    self.camera_id = camera_id
-    self.sensitivity = sensitivity
-    self.photo_interval = photo_interval
-    self.motion_timeout = motion_timeout
-    self.frame_width, self.frame_height = resolution
-    self.fps = fps
-    
-    # Use script directory for photos with date-based organization
-    self.script_dir = os.path.dirname(os.path.abspath(__file__))
-    self.base_photo_dir = os.path.join(self.script_dir, "motion_photos")
-    os.makedirs(self.base_photo_dir, exist_ok=True)
-    
-    # Current session directory (will be set when motion starts)
-    self.current_session_dir = None
-    
-    # Motion detection - simplified for low resource usage
-    self.background_subtractor = cv2.createBackgroundSubtractorMOG2(
-        history=100,  # Reduced history for less memory
-        varThreshold=30,  # Lower threshold for better detection
-        detectShadows=False  # Disable shadow detection to save CPU
-    )
-    
-    # State variables
-    self.cap = None
-    self.running = False
-    self.last_motion_time = 0
-    self.last_photo_time = 0
-    self.motion_detected = False
-    self.photo_count = 0
-    self.motion_sequence = 0
-    self.motion_boxes = []  # Store detected motion bounding boxes
-    
-    # Performance counters
-    self.frame_count = 0
-    self.start_time = time.time()
-    
-    print(f"Low Power Motion Detector initialized")
-    print(f"Camera ID: {camera_id}")
-    print(f"Resolution: {self.frame_width}x{self.frame_height}")
-    print(f"FPS: {fps}")
-    print(f"Sensitivity: {sensitivity}")
-    print(f"Base photo directory: {self.base_photo_dir}")
-
-def create_session_directory(self):
-    """Create a new directory for the current motion detection session"""
-    # Create directory name based on current date and time
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    session_dir_name = f"detection_{timestamp}"
-    self.current_session_dir = os.path.join(self.base_photo_dir, session_dir_name)
-    
-    # Create the directory
-    os.makedirs(self.current_session_dir, exist_ok=True)
-    print(f"Created session directory: {session_dir_name}")
-    return self.current_session_dir
-
-def find_usb_camera(self):
-    """Find available USB camera - simplified"""
-    for camera_id in range(5):  # Check first 5 camera indices
-        cap = cv2.VideoCapture(camera_id)
-        if cap.isOpened():
-            ret, frame = cap.read()
-            cap.release()
-            if ret:
-                print(f"Found USB camera at index {camera_id}")
-                return camera_id
-    return self.camera_id
-
-def initialize_camera(self):
-    """Initialize USB camera with minimal resource settings"""
-    # Find camera if needed
-    if self.camera_id == 0:
-        self.camera_id = self.find_usb_camera()
-    
-    self.cap = cv2.VideoCapture(self.camera_id)
-    
-    if not self.cap.isOpened():
-        print(f"Error: Could not open USB camera at index {self.camera_id}")
-        return False
-    
-    # Set minimal resource properties
-    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-    self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer
-    
-    # Use MJPEG for USB cameras (more efficient)
-    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-    
-    # Verify settings
-    actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-    
-    print(f"Camera initialized: {actual_width}x{actual_height} @ {actual_fps:.1f}fps")
-    return True
-
-def detect_motion(self, frame):
-    """Lightweight motion detection with bounding box detection"""
-    # Apply background subtraction
-    fg_mask = self.background_subtractor.apply(frame)
-    
-    # Simple noise reduction - minimal processing
-    kernel = np.ones((3, 3), np.uint8)
-    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-    
-    # Find contours for bounding boxes
-    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Filter contours and get bounding boxes
-    motion_boxes = []
-    total_motion_area = 0
-    
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area > 50:  # Filter small noise
-            x, y, w, h = cv2.boundingRect(contour)
-            # Filter tiny boxes
-            if w > 10 and h > 10:
-                motion_boxes.append((x, y, w, h))
-                total_motion_area += area
-    
-    # Store motion boxes for drawing
-    self.motion_boxes = motion_boxes
-    
-    return total_motion_area > self.sensitivity
-
-def save_photo(self, frame):
-    """Save photo with timestamp and motion detection boxes"""
-    current_time = time.time()
-    
-    # Check if enough time has passed since last photo
-    if current_time - self.last_photo_time < self.photo_interval:
-        return False
-    
-    # Ensure we have a session directory
-    if self.current_session_dir is None:
-        self.create_session_directory()
-    
-    # Create a copy of the frame to draw on
-    photo_frame = frame.copy()
-    
-    # Draw bounding boxes around detected motion
-    for i, (x, y, w, h) in enumerate(self.motion_boxes):
-        # Draw green rectangle around detected object
-        cv2.rectangle(photo_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    def __init__(self, camera_id=0, sensitivity=1000, photo_interval=2.0,
+                 motion_timeout=5.0, resolution=(320, 240), fps=5):
+        self.camera_id = camera_id
+        self.sensitivity = sensitivity
+        self.photo_interval = photo_interval
+        self.motion_timeout = motion_timeout
+        self.frame_width, self.frame_height = resolution
+        self.fps = fps
         
-        # Add object number label
-        label = f"Object {i+1}"
-        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.base_photo_dir = os.path.join(self.script_dir, "motion_photos")
+        os.makedirs(self.base_photo_dir, exist_ok=True)
         
-        # Position label above the box
-        label_y = y - 10 if y - 10 > 10 else y + h + 20
-        cv2.rectangle(photo_frame, (x, label_y - label_size[1] - 5), 
-                     (x + label_size[0] + 5, label_y + 5), (0, 255, 0), -1)
-        cv2.putText(photo_frame, label, (x + 2, label_y - 2), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-    
-    # Add timestamp and detection info
-    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    detection_info = f"Objects: {len(self.motion_boxes)} | {timestamp_str}"
-    
-    # Add text background
-    text_size = cv2.getTextSize(detection_info, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
-    cv2.rectangle(photo_frame, (10, 10), (20 + text_size[0], 35), (0, 0, 0), -1)
-    cv2.putText(photo_frame, detection_info, (15, 28), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-    
-    # Generate filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"motion_{self.motion_sequence:03d}_{timestamp}_{self.photo_count:03d}.jpg"
-    filepath = os.path.join(self.current_session_dir, filename)
-    
-    # Save photo with high compression to save space
-    cv2.imwrite(filepath, photo_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    
-    self.last_photo_time = current_time
-    self.photo_count += 1
-    
-    # Show relative path for cleaner output
-    relative_path = os.path.relpath(filepath, self.script_dir)
-    print(f"Photo saved: {relative_path} ({len(self.motion_boxes)} objects detected)")
-    return True
+        self.current_session_dir = None
+        
+        self.background_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=100,
+            varThreshold=30,
+            detectShadows=False
+        )
+        
+        self.cap = None
+        self.running = False
+        self.last_motion_time = 0
+        self.last_photo_time = 0
+        self.motion_detected = False
+        self.photo_count = 0
+        self.motion_sequence = 0
+        self.motion_boxes = []
+        
+        self.frame_count = 0
+        self.start_time = time.time()
+        
+        print(f"Low Power Motion Detector initialized")
+        print(f"Camera ID: {camera_id}")
+        print(f"Resolution: {self.frame_width}x{self.frame_height}")
+        print(f"FPS: {fps}")
+        print(f"Sensitivity: {sensitivity}")
+        print(f"Base photo directory: {self.base_photo_dir}")
 
-def run(self):
-    """Main detection loop"""
-    if not self.initialize_camera():
-        return False
-    
-    self.running = True
-    print("Starting motion detection...")
-    print("Press Ctrl+C to stop")
-    
-    try:
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                print("Failed to read frame")
-                break
-            
-            current_time = time.time()
-            self.frame_count += 1
-            
-            # Detect motion
-            motion_detected = self.detect_motion(frame)
-            
-            if motion_detected:
-                if not self.motion_detected:
-                    # New motion sequence started
-                    self.motion_sequence += 1
-                    self.photo_count = 0
-                    # Create new session directory for this detection sequence
-                    self.create_session_directory()
-                    print(f"Motion detected! Starting sequence {self.motion_sequence}")
-                
-                self.motion_detected = True
-                self.last_motion_time = current_time
-                
-                # Save photo
-                self.save_photo(frame)
-                
-            else:
-                # Check if motion has stopped
-                if (self.motion_detected and 
-                    current_time - self.last_motion_time > self.motion_timeout):
-                    print(f"Motion stopped. Sequence {self.motion_sequence} complete ({self.photo_count} photos)")
-                    print(f"Photos saved to: {os.path.relpath(self.current_session_dir, self.script_dir)}")
-                    self.motion_detected = False
-                    # Reset session directory so next motion creates a new one
-                    self.current_session_dir = None
-            
-            # Print status periodically
-            if self.frame_count % (self.fps * 10) == 0:  # Every 10 seconds
-                elapsed = current_time - self.start_time
-                fps_actual = self.frame_count / elapsed
-                status = "MOTION" if self.motion_detected else "MONITORING"
-                objects_str = f" ({len(self.motion_boxes)} objects)" if self.motion_detected else ""
-                print(f"Status: {status}{objects_str} | FPS: {fps_actual:.1f} | Total sequences: {self.motion_sequence}")
-            
-            # Small delay to prevent excessive CPU usage
-            time.sleep(0.1)
-            
-    except KeyboardInterrupt:
-        print("\nStopping motion detection...")
-    finally:
-        self.cleanup()
-    
-    return True
+    def create_session_directory(self):
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        session_dir_name = f"detection_{timestamp}"
+        self.current_session_dir = os.path.join(self.base_photo_dir, session_dir_name)
+        
+        os.makedirs(self.current_session_dir, exist_ok=True)
+        print(f"Created session directory: {session_dir_name}")
+        return self.current_session_dir
 
-def cleanup(self):
-    """Clean up resources"""
-    self.running = False
-    if self.cap:
-        self.cap.release()
-    
-    # Print summary
-    elapsed = time.time() - self.start_time
-    print(f"\nSummary:")
-    print(f"Total runtime: {elapsed:.1f} seconds")
-    print(f"Total frames processed: {self.frame_count}")
-    print(f"Motion sequences: {self.motion_sequence}")
-    print(f"Photos organized in: {self.base_photo_dir}")
-    
-    # List created directories
-    if os.path.exists(self.base_photo_dir):
-        directories = [d for d in os.listdir(self.base_photo_dir) 
-                     if os.path.isdir(os.path.join(self.base_photo_dir, d)) and d.startswith('detection_')]
-        if directories:
-            print(f"Detection sessions created:")
-            for dir_name in sorted(directories):
-                dir_path = os.path.join(self.base_photo_dir, dir_name)
-                photo_count = len([f for f in os.listdir(dir_path) if f.endswith('.jpg')])
-                print(f"  {dir_name} ({photo_count} photos)")
-    
-    print("Cleanup complete")
-```
+    def find_usb_camera(self):
+        for camera_id in range(5):
+            cap = cv2.VideoCapture(camera_id)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                cap.release()
+                if ret:
+                    print(f"Found USB camera at index {camera_id}")
+                    return camera_id
+        return self.camera_id
+
+    def initialize_camera(self):
+        if self.camera_id == 0:
+            self.camera_id = self.find_usb_camera()
+        
+        self.cap = cv2.VideoCapture(self.camera_id)
+        
+        if not self.cap.isOpened():
+            print(f"Error: Could not open USB camera at index {self.camera_id}")
+            return False
+        
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        
+        actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        
+        print(f"Camera initialized: {actual_width}x{actual_height} @ {actual_fps:.1f}fps")
+        return True
+
+    def detect_motion(self, frame):
+        fg_mask = self.background_subtractor.apply(frame)
+        
+        kernel = np.ones((3, 3), np.uint8)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+        
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        motion_boxes = []
+        total_motion_area = 0
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 50:
+                x, y, w, h = cv2.boundingRect(contour)
+                if w > 10 and h > 10:
+                    motion_boxes.append((x, y, w, h))
+                    total_motion_area += area
+        
+        self.motion_boxes = motion_boxes
+        
+        return total_motion_area > self.sensitivity
+
+    def save_photo(self, frame):
+        current_time = time.time()
+        
+        if current_time - self.last_photo_time < self.photo_interval:
+            return False
+        
+        if self.current_session_dir is None:
+            self.create_session_directory()
+        
+        photo_frame = frame.copy()
+        
+        for i, (x, y, w, h) in enumerate(self.motion_boxes):
+            cv2.rectangle(photo_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            
+            label = f"Object {i+1}"
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            
+            label_y = y - 10 if y - 10 > 10 else y + h + 20
+            cv2.rectangle(photo_frame, (x, label_y - label_size[1] - 5), 
+                         (x + label_size[0] + 5, label_y + 5), (0, 255, 0), -1)
+            cv2.putText(photo_frame, label, (x + 2, label_y - 2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        detection_info = f"Objects: {len(self.motion_boxes)} | {timestamp_str}"
+        
+        text_size = cv2.getTextSize(detection_info, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+        cv2.rectangle(photo_frame, (10, 10), (20 + text_size[0], 35), (0, 0, 0), -1)
+        cv2.putText(photo_frame, detection_info, (15, 28), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"motion_{self.motion_sequence:03d}_{timestamp}_{self.photo_count:03d}.jpg"
+        filepath = os.path.join(self.current_session_dir, filename)
+        
+        cv2.imwrite(filepath, photo_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        
+        self.last_photo_time = current_time
+        self.photo_count += 1
+        
+        relative_path = os.path.relpath(filepath, self.script_dir)
+        print(f"Photo saved: {relative_path} ({len(self.motion_boxes)} objects detected)")
+        return True
+
+    def run(self):
+        if not self.initialize_camera():
+            return False
+        
+        self.running = True
+        print("Starting motion detection...")
+        print("Press Ctrl+C to stop")
+        
+        try:
+            while self.running:
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("Failed to read frame")
+                    break
+                
+                current_time = time.time()
+                self.frame_count += 1
+                
+                motion_detected = self.detect_motion(frame)
+                
+                if motion_detected:
+                    if not self.motion_detected:
+                        self.motion_sequence += 1
+                        self.photo_count = 0
+                        self.create_session_directory()
+                        print(f"Motion detected! Starting sequence {self.motion_sequence}")
+                    
+                    self.motion_detected = True
+                    self.last_motion_time = current_time
+                    
+                    self.save_photo(frame)
+                    
+                else:
+                    if (self.motion_detected and 
+                        current_time - self.last_motion_time > self.motion_timeout):
+                        print(f"Motion stopped. Sequence {self.motion_sequence} complete ({self.photo_count} photos)")
+                        print(f"Photos saved to: {os.path.relpath(self.current_session_dir, self.script_dir)}")
+                        self.motion_detected = False
+                        self.current_session_dir = None
+                
+                if self.frame_count % (self.fps * 10) == 0:
+                    elapsed = current_time - self.start_time
+                    fps_actual = self.frame_count / elapsed
+                    status = "MOTION" if self.motion_detected else "MONITORING"
+                    objects_str = f" ({len(self.motion_boxes)} objects)" if self.motion_detected else ""
+                    print(f"Status: {status}{objects_str} | FPS: {fps_actual:.1f} | Total sequences: {self.motion_sequence}")
+                
+                time.sleep(0.1)
+                
+        except KeyboardInterrupt:
+            print("\nStopping motion detection...")
+        finally:
+            self.cleanup()
+        
+        return True
+
+    def cleanup(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        
+        elapsed = time.time() - self.start_time
+        print(f"\nSummary:")
+        print(f"Total runtime: {elapsed:.1f} seconds")
+        print(f"Total frames processed: {self.frame_count}")
+        print(f"Motion sequences: {self.motion_sequence}")
+        print(f"Photos organized in: {self.base_photo_dir}")
+        
+        if os.path.exists(self.base_photo_dir):
+            directories = [d for d in os.listdir(self.base_photo_dir) 
+                         if os.path.isdir(os.path.join(self.base_photo_dir, d)) and d.startswith('detection_')]
+            if directories:
+                print(f"Detection sessions created:")
+                for dir_name in sorted(directories):
+                    dir_path = os.path.join(self.base_photo_dir, dir_name)
+                    photo_count = len([f for f in os.listdir(dir_path) if f.endswith('.jpg')])
+                    print(f"  {dir_name} ({photo_count} photos)")
+        
+        print("Cleanup complete")
 
 def signal_handler(sig, frame):
-“”“Handle Ctrl+C gracefully”””
-print(”\nReceived interrupt signal…”)
-sys.exit(0)
+    print("\nReceived interrupt signal...")
+    sys.exit(0)
 
 def main():
-parser = argparse.ArgumentParser(description=“Low Power Motion Detection Photo Capture”)
-parser.add_argument(”–camera”, type=int, default=0, help=“USB Camera ID (default: 0)”)
-parser.add_argument(”–sensitivity”, type=int, default=1000,
-help=“Motion sensitivity - lower = more sensitive (default: 1000)”)
-parser.add_argument(”–photo-interval”, type=float, default=2.0,
-help=“Minimum seconds between photos (default: 2.0)”)
-parser.add_argument(”–motion-timeout”, type=float, default=5.0,
-help=“Seconds to wait after motion stops (default: 5.0)”)
-parser.add_argument(”–resolution”, type=str, default=“320x240”,
-help=“Camera resolution WxH (default: 320x240)”)
-parser.add_argument(”–fps”, type=int, default=5,
-help=“Camera FPS - lower = less CPU usage (default: 5)”)
-parser.add_argument(”–test-camera”, action=“store_true”,
-help=“Test camera and exit”)
+    parser = argparse.ArgumentParser(description="Low Power Motion Detection Photo Capture")
+    parser.add_argument("--camera", type=int, default=0, help="USB Camera ID (default: 0)")
+    parser.add_argument("--sensitivity", type=int, default=1000,
+                        help="Motion sensitivity - lower = more sensitive (default: 1000)")
+    parser.add_argument("--photo-interval", type=float, default=2.0,
+                        help="Minimum seconds between photos (default: 2.0)")
+    parser.add_argument("--motion-timeout", type=float, default=5.0,
+                        help="Seconds to wait after motion stops (default: 5.0)")
+    parser.add_argument("--resolution", type=str, default="320x240",
+                        help="Camera resolution WxH (default: 320x240)")
+    parser.add_argument("--fps", type=int, default=5,
+                        help="Camera FPS - lower = less CPU usage (default: 5)")
+    parser.add_argument("--test-camera", action="store_true",
+                        help="Test camera and exit")
 
-```
-args = parser.parse_args()
+    args = parser.parse_args()
 
-# Parse resolution
-try:
-    width, height = map(int, args.resolution.split('x'))
-    resolution = (width, height)
-except ValueError:
-    print("Invalid resolution format. Use WxH (e.g., 320x240)")
-    return 1
-
-# Test camera mode
-if args.test_camera:
-    print("Testing camera...")
-    detector = LowPowerMotionDetector(camera_id=args.camera, resolution=resolution)
-    if detector.initialize_camera():
-        print("Camera test successful!")
-        detector.cleanup()
-        return 0
-    else:
-        print("Camera test failed!")
+    try:
+        width, height = map(int, args.resolution.split('x'))
+        resolution = (width, height)
+    except ValueError:
+        print("Invalid resolution format. Use WxH (e.g., 320x240)")
         return 1
 
-# Setup signal handler
-signal.signal(signal.SIGINT, signal_handler)
+    if args.test_camera:
+        print("Testing camera...")
+        detector = LowPowerMotionDetector(camera_id=args.camera, resolution=resolution)
+        if detector.initialize_camera():
+            print("Camera test successful!")
+            detector.cleanup()
+            return 0
+        else:
+            print("Camera test failed!")
+            return 1
 
-# Create and run detector
-detector = LowPowerMotionDetector(
-    camera_id=args.camera,
-    sensitivity=args.sensitivity,
-    photo_interval=args.photo_interval,
-    motion_timeout=args.motion_timeout,
-    resolution=resolution,
-    fps=args.fps
-)
+    signal.signal(signal.SIGINT, signal_handler)
 
-success = detector.run()
-return 0 if success else 1
-```
+    detector = LowPowerMotionDetector(
+        camera_id=args.camera,
+        sensitivity=args.sensitivity,
+        photo_interval=args.photo_interval,
+        motion_timeout=args.motion_timeout,
+        resolution=resolution,
+        fps=args.fps
+    )
 
-if **name** == “**main**”:
-sys.exit(main())
+    success = detector.run()
+    return 0 if success else 1
+
+if __name__ == "__main__":
+    sys.exit(main())
